@@ -18,7 +18,12 @@ using Base.Broadcast: broadcasted, broadcast_shape
 
 # Array Constructors
 @adjoint (::Type{T})(x::T) where T<:Array = T(x), ȳ -> (ȳ,)
-@adjoint (::Type{T})(x::Number, sz) where {T <: Fill} = Fill(x, sz), Δ -> (sum(Δ), nothing)
+@adjoint function (::Type{T})(x::Number, sz) where {T <: Fill}
+    back(Δ::AbstractArray) = (sum(Δ), nothing)
+    back(Δ::NamedTuple) = (Δ.value, nothing)
+    return Fill(x, sz), back
+end
+
 @adjoint (::Type{T})(sz) where {T<:Zeros} = Zeros(sz), Δ->(nothing,)
 @adjoint (::Type{T})(sz) where {T<:Ones} = Ones(sz), Δ->(nothing,)
 
@@ -155,6 +160,11 @@ end
 
 @adjoint iterate(r::UnitRange, i...) = iterate(r, i...), _ -> nothing
 
+@adjoint function sort(x::AbstractArray)
+  p = sortperm(x)
+  return x[p], x̄ -> (x̄[invperm(p)],)
+end
+
 # Reductions
 
 @adjoint function sum(xs::AbstractArray; dims = :)
@@ -188,7 +198,7 @@ function _pullback(cx::AContext, ::typeof(prod), f, xs::AbstractArray)
   y, ȳ -> (nothing, nothing, back(ȳ)...)
 end
 
-@adjoint function maximum(xs; dims = :)
+@adjoint function maximum(xs::AbstractArray; dims = :)
   max, i = findmax(xs, dims = dims)
   max, function (Δ)
     Δ isa Real && abs(Δ) <= sqrt(eps(float(Δ))) && return nothing
@@ -198,7 +208,7 @@ end
   end
 end
 
-@adjoint function minimum(xs; dims = :)
+@adjoint function minimum(xs::AbstractArray; dims = :)
   min, i = findmin(xs, dims = dims)
   min, function (Δ)
     Δ′ = zero(xs)
@@ -489,7 +499,8 @@ end
   X = _pairdiffquotmat(exp, n, w, ew, ew, ew)
   V = E.vectors
   VF = factorize(V)
-  Ā = (V * ((VF \ F̄' * V) .* X) / VF)'
+  Āc = (V * ((VF \ F̄' * V) .* X) / VF)'
+  Ā = isreal(A) && isreal(F̄) ? real(Āc) : Āc
   return (Ā,)
 end
 
@@ -694,6 +705,18 @@ end
   end
 end
 
+@adjoint function Matrix(::UniformScaling, i::Integer, j::Integer)
+  return Matrix(I, i, j), Δ -> ((λ=tr(Δ),), nothing, nothing)
+end
+@adjoint function Matrix(::UniformScaling, ij::NTuple{2, Integer})
+  return Matrix(I, ij), Δ -> ((λ=tr(Δ),), nothing)
+end
+@adjoint function Matrix{T}(::UniformScaling, i::Integer, j::Integer) where {T}
+  return Matrix{T}(I, i, j), Δ -> ((λ=tr(Δ),), nothing, nothing)
+end
+@adjoint function Matrix{T}(::UniformScaling, ij::NTuple{2, Integer}) where {T}
+  return Matrix{T}(I, ij), Δ -> ((λ=tr(Δ),), nothing)
+end
 @adjoint function +(A::AbstractMatrix, S::UniformScaling)
   return A + S, Δ->(Δ, (λ=sum(view(Δ, diagind(Δ))),))
 end
