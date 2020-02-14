@@ -753,8 +753,8 @@ end
 # all of the plans normalize their inverse, while we need the unnormalized one.
 @adjoint function *(P::AbstractFFTs.Plan, xs)
   return P * xs, function(Δ)
-    N = prod(size(xs)[P.region])
-    return (nothing, N * (P \ Δ))
+      N = prod(size(xs)[[P.region...]])
+      return (nothing, N * (P \ Δ))
   end
 end
 
