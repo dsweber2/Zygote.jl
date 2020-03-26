@@ -1,7 +1,7 @@
 using Zygote, NNlib, Test, Random, LinearAlgebra, Statistics, FillArrays,
-    AbstractFFTs, FFTW
+    AbstractFFTs, FFTW, Distances
 using Zygote: gradient
-using NNlib: conv, ∇conv_data, depthwiseconv
+using NNlib: conv, ∇conv_data, depthwiseconv, batched_mul
 using Base.Broadcast: broadcast_shape
 
 function ngradient(f, xs::AbstractArray...)
@@ -41,7 +41,36 @@ end
 
 Random.seed!(0)
 
+@testset "println, show, print" begin
+  function foo(x)
+    Base.show(x)
+    Base.print(x)
+    Base.println(x)
+    Core.show(x)
+    Core.print(x)
+    Core.println(x)
+    return x
+  end
+  @test gradtest(foo, [5.0])
+end
+
 @test gradient(//, 2, 3) === (1//3, -2//9)
+
+@testset "power" begin
+  @test gradient(x -> x^2, -2) == (-4,)
+  @test gradient(x -> x^10, -1.0) == (-10,) # literal_pow
+  pow = 10
+  @test gradient(x -> x^pow, -1.0) == (-pow,)
+  @test gradient(p -> real(2^p), 2)[1] ≈ 4*log(2)
+
+  @test gradient(xs ->sum(xs .^ 2), [2, -1]) == ([4, -2],)
+  @test gradient(xs ->sum(xs .^ 10), [3, -1]) == ([10*3^9, -10],)
+  @test gradient(xs ->sum(xs .^ pow), [4, -1]) == ([pow*4^9, -10],)
+
+  @test gradient(x -> real((1+3im) * x^2), 5+7im) == (-32 - 44im,)
+  @test gradient(p -> real((1+3im) * (5+7im)^p), 2)[1] ≈ (-234 + 2im)*log(5 - 7im)
+  # D[(1+3I)x^p, p] /. {x->5+7I, p->2} // Conjugate
+end
 
 @test gradtest((a,b)->sum(reim(acosh(complex(a[1], b[1])))), [-2.0], [1.0])
 
@@ -63,10 +92,25 @@ Random.seed!(0)
 @test gradtest(x -> sum(abs2, x), randn(4, 3, 2))
 @test gradtest(x -> sum(abs2, x; dims=1), randn(4, 3, 2))
 @test gradtest(x -> sum(x[i] for i in 1:length(x)), randn(10))
-@test_broken gradtest(x -> sum(i->x[i], 1:length(x)), randn(10)) # https://github.com/FluxML/Zygote.jl/issues/231
+@test gradtest(x -> sum(i->x[i], 1:length(x)), randn(10)) # https://github.com/FluxML/Zygote.jl/issues/231
+@test gradtest(x -> sum((i->x[i]).(1:length(x))), randn(10))
 
-@test_broken gradtest(x -> prod(x, dims = (2, 3)), (3,4,5))
-@test gradtest(x -> prod(x), (3,4,5))
+# https://github.com/FluxML/Zygote.jl/issues/314
+@test gradient((x,y) -> sum(yi -> yi*x, y), 1, [1,1]) == (2, [1, 1])
+@test gradient((x,y) -> prod(yi -> yi*x, y), 1, [1,1]) == (2, [1, 1])
+
+@test gradient((x,y) -> sum(map(yi -> yi*x, y)), 1, [1,1]) == (2, [1, 1])
+@test gradient((x,y) -> prod(map(yi -> yi*x, y)), 1, [1,1]) == (2, [1, 1])
+
+@test gradtest(x -> prod(x, dims = (2, 3)), (3,4,5))
+@test gradtest(x -> prod(x), (3,4))
+@test gradient(x -> prod(x), (1,2,3))[1] == (6,3,2)
+
+@test gradtest(x -> cumsum(x, dims=2), (3,4,5))
+@test gradtest(x -> cumsum(x, dims=1), (3,))
+@test gradtest(x -> cumsum(x), (4,))
+@test gradtest(x -> cumsum(x, dims=3), (5,))  # trivial
+@test gradtest(x -> cumsum(x, dims=3), (3,4)) # trivial
 
 @test gradtest(x -> softmax(x).*(1:3), 3)
 @test gradtest(x -> softmax(x).*(1:3), (3,5))
@@ -80,6 +124,8 @@ Random.seed!(0)
 @test gradtest(det, (4, 4))
 @test gradtest(logdet, map(x -> x*x', (rand(4, 4),))[1])
 @test gradtest(x -> logabsdet(x)[1], (4, 4))
+@test gradient(det, 2.0)[1] == 1
+@test gradient(logdet, 2.0)[1] == 0.5
 
 @testset "getindex" begin
   @test gradtest(x -> x[:,2,:], (3,4,5))
@@ -100,6 +146,15 @@ Random.seed!(0)
   # https://github.com/FluxML/Zygote.jl/issues/376
   _, back = Zygote._pullback(x->x[1]*im, randn(2))
   @test back(1.0)[2] == [-im, 0]
+
+  # _droplike
+  @test gradient(x -> sum(inv, x[1,:]'), ones(2,2)) == ([-1 -1; 0 0],)
+  @test gradient(x -> sum(inv, x[1:1,:]'), ones(2,2)) == ([-1 -1; 0 0],)
+  @test gradient(x -> sum(inv, transpose(view(x,1,:))), ones(2,2)) == ([-1 -1; 0 0],)
+
+  # https://github.com/FluxML/Zygote.jl/issues/513
+  @test gradient(p -> sum(Float32[1,0] - p), [2,3]) == ([-1,-1],)
+  @test gradient(x -> sum(Float32[1,x] .+ x), 4) == (3.0f0,)
 end
 
 @testset "view" begin
@@ -112,15 +167,40 @@ end
   @test gradient(g, ones(3)) == ([1,0,0],)
 end
 
+@testset "collect" begin
+  @test gradient(x -> sum(inv, collect(x)), (1,2)) === ((-1.0, -1/4),)
+
+  @test gradient(x -> sum(collect(view(x, 1:1))), rand(2)) == ([1,0],)
+  @test gradient(x -> sum(inv, collect(view(x', 1,:))), ones(2,2)) == ([-1 0; -1 0],)
+
+  @test gradient(xs -> sum(inv, [x^2 for x in xs]), ones(2)) == ([-2, -2],)
+end
+
 @testset "conv: spatial_rank=$spatial_rank" for spatial_rank in (1, 2, 3)
-  x = rand(repeat([10], spatial_rank)..., 3, 2)
+  x = rand(repeat([5], spatial_rank)..., 3, 2)
   w = rand(repeat([3], spatial_rank)..., 3, 3)
   cdims = DenseConvDims(x, w)
   @test gradtest((x, w) -> conv(x, w, cdims), x, w)
+  @test gradtest((x, w) -> sum(conv(x, w, cdims)), x, w)  # https://github.com/FluxML/Flux.jl/issues/1055
+
   y = conv(x, w, cdims)
   @test gradtest((y, w) -> ∇conv_data(y, w, cdims), y, w)
+  if spatial_rank == 3
+    @test_broken gradtest((y, w) -> sum(∇conv_data(y, w, cdims)), y, w)
+  else
+    @test gradtest((y, w) -> sum(∇conv_data(y, w, cdims)), y, w)
+  end
+
   dcdims = DepthwiseConvDims(x, w)
   @test gradtest((x, w) -> depthwiseconv(x, w, dcdims), x, w)
+
+  y = depthwiseconv(x, w, dcdims)
+  @test gradtest((y, w) -> ∇depthwiseconv_data(y, w, dcdims), y, w)
+  if spatial_rank == 3
+    @test_broken gradtest((y, w) -> sum(∇depthwiseconv_data(y, w, dcdims)), y, w)
+  else
+    @test gradtest((y, w) -> sum(∇depthwiseconv_data(y, w, dcdims)), y, w)
+  end
 end
 
 @testset "pooling: spatial_rank=$spatial_rank" for spatial_rank in (1, 2)
@@ -128,7 +208,14 @@ end
   pdims = PoolDims(x, 2)
   @test gradtest(x -> maxpool(x, pdims), x)
   @test gradtest(x -> meanpool(x, pdims), x)
+  @test gradtest(x -> sum(maxpool(x, pdims)), x)
+  @test gradtest(x -> sum(meanpool(x, pdims)), x)
 end
+
+@test gradtest(x -> reverse(x), rand(17))
+@test gradtest(x -> reverse(x, 8), rand(17))
+@test gradtest(x -> reverse(x, 8, 13), rand(17))
+@test gradtest(x -> reverse(x, dims=2), rand(17, 42))
 
 @test gradtest(x -> permutedims(x), rand(2))
 @test gradtest(x -> permutedims(x), rand(2,3))
@@ -142,6 +229,11 @@ end
 @test gradtest(x -> repeat(x; inner=2), rand(5))
 @test gradtest(x -> repeat(x; inner=2, outer=3), rand(5))
 @test gradtest(x -> repeat(x; inner=(2,2,1), outer=(1,1,3)), rand(5,4,3))
+
+@test gradtest(x -> repeat(x, 3), rand(5))
+@test gradtest(x -> repeat(x, 2, 3), rand(5))
+@test gradtest(x -> repeat(x, 5), rand(5,7))
+@test gradtest(x -> repeat(x, 3, 2), rand(5,3))
 
 @test gradtest(tr, rand(4, 4))
 
@@ -189,6 +281,16 @@ end
 @testset "sort" begin
   @test gradtest(sort, 5)
 end
+
+@testset "filter" begin
+  @test gradtest(xs -> filter(x -> x > 0.5, xs), 20)
+
+  @test gradient(x -> sum(log, filter(iseven, x)), 1:10) ==
+    (map(x -> iseven(x) ? 1/x : 0, 1:10),)
+  @test gradient(x -> sum(abs2, im .+ filter(iseven, x)), 1:10) ==
+    (map(x -> iseven(x) ? 2x+2im : 0, 1:10),)
+end
+
 
 @testset "mean" begin
   @test gradtest(mean, rand(2, 3))
@@ -303,11 +405,13 @@ end
   @test gradtest(pinv, A)
   @test gradtest(inv, B)
   @test gradtest(pinv, C)
+  @test gradient(inv, 2.0)[1] == -0.25
 end
 
 @testset "multiplication" begin
+  rng, M, P, Q = MersenneTwister(123456), 13, 7, 11
   @testset "matrix-matrix" begin
-    rng, M, P, Q = MersenneTwister(123456), 13, 7, 11
+
     @test gradtest(*, randn(rng, M, P), randn(rng, P, Q))
     @test gradtest(*, randn(rng, M, P), randn(rng, P))
     @test gradtest(*, randn(rng, M, 1), randn(rng, 1, Q))
@@ -322,6 +426,11 @@ end
       y, back = Zygote.pullback(*, randn(rng, M), randn(rng, 1, P))
       @test first(back(randn(rng, M, P))) isa Vector
     end
+  end
+
+  @testset "batched matrix multiplication" begin
+    B = 3
+    @test gradtest(batched_mul, randn(rng, M, P, B), randn(rng, P, Q, B))
   end
 end
 
@@ -404,13 +513,17 @@ end
   @test gradtest((U, Y) -> Y' / UnitUpperTriangular(U), U, y)
 
   @testset "Cholesky" begin
-
     # Check that the forwards pass computes the correct thing.
-    @test Zygote.pullback(X->cholesky(X * X' + I) \ Y, X)[1] == cholesky(X * X' + I) \ Y
-    @test gradtest(X->cholesky(X * X' + I) \ Y, X)
-    @test gradtest(Y->cholesky(X * X' + I) \ Y, Y)
-    @test gradtest(X->cholesky(X * X' + I) \ y, X)
-    @test gradtest(y->cholesky(X * X' + I) \ y, y)
+    f(X, Y) = cholesky(X * X' + I) \ Y
+    @test Zygote.pullback(X -> f(X, Y), X)[1] == cholesky(X * X' + I) \ Y
+    @test gradtest(X -> f(X, Y), X)
+    @test gradtest(Y -> f(X, Y), Y)
+    @test gradtest(X -> f(X, y), X)
+    @test gradtest(y -> f(X, y), y)
+    g(X) = cholesky(X * X' + I)
+    @test Zygote.pullback(g, X)[2]((factors=LowerTriangular(X),)) == 
+      Zygote.pullback(g, X)[2]((factors=Matrix(LowerTriangular(X)),))
+    @test_throws PosDefException Zygote.pullback(X -> cholesky(X, check = false), X)[2]((factors=X,))
   end
 end
 
@@ -857,57 +970,49 @@ end
   end
 end
 
-using Distances
-
-Zygote.refresh()
-
 @testset "distances" begin
   rng, P, Q, D = MersenneTwister(123456), 10, 9, 8
 
-   # Check sqeuclidean.
-  let
-    x, y = randn(rng, D), randn(rng, D)
-    @test gradtest(x->sqeuclidean(x, y), x)
-    @test gradtest(y->sqeuclidean(x, y), y)
-  end
+  for (f, metric) in ((euclidean, Euclidean()), (sqeuclidean, SqEuclidean()))
+    let
+      x, y = randn(rng), randn(rng)
+      @test gradtest(x -> f(x[1], y), [x])
+      @test gradtest(x -> evaluate(metric, x[1], y), [x])
+      @test gradtest(y -> f(x, y[1]), [y])
+      @test gradtest(y -> evaluate(metric, x, y[1]), [y])
+    end
 
-   # Check binary colwise.
-  let
-    X, Y = randn(rng, D, P), randn(rng, D, P)
-    @test gradtest(X->colwise(SqEuclidean(), X, Y), X)
-    @test gradtest(Y->colwise(SqEuclidean(), X, Y), Y)
-  end
+    let
+      x, y = randn(rng, D), randn(rng, D)
+      @test gradtest(x -> f(x, y), x)
+      @test gradtest(x -> evaluate(metric, x, y), x)
+      @test gradtest(y -> f(x, y), y)
+      @test gradtest(y -> evaluate(metric, x, y), y)
+    end
 
-   # Check binary pairwise.
-  let
-    X, Y = randn(rng, D, P), randn(rng, D, Q)
-    @test gradtest(X->pairwise(SqEuclidean(), X, Y; dims=2), X)
-    @test gradtest(Y->pairwise(SqEuclidean(), X, Y; dims=2), Y)
-  end
-  let
-    Xt, Yt = randn(rng, P, D), randn(rng, Q, D)
-    @test gradtest(Xt->pairwise(SqEuclidean(), Xt, Yt; dims=1), Xt)
-    @test gradtest(Yt->pairwise(SqEuclidean(), Xt, Yt; dims=1), Yt)
-  end
+    # Check binary colwise.
+    let
+      X, Y = randn(rng, D, P), randn(rng, D, P)
+      @test gradtest(X->colwise(metric, X, Y), X)
+      @test gradtest(Y->colwise(metric, X, Y), Y)
+    end
 
-   # Check unary pairwise.
-  @test gradtest(X->pairwise(SqEuclidean(), X; dims=2), randn(rng, D, P))
-  @test gradtest(Xt->pairwise(SqEuclidean(), Xt; dims=1), randn(rng, P, D))
+    # Check binary pairwise.
+    let
+      X, Y = randn(rng, D, P), randn(rng, D, Q)
+      @test gradtest(X->pairwise(metric, X, Y; dims=2), X)
+      @test gradtest(Y->pairwise(metric, X, Y; dims=2), Y)
+    end
 
-  @testset "colwise(::Euclidean, X, Y; dims=2)" begin
-    rng, D, P = MersenneTwister(123456), 2, 3
-    X, Y, D̄ = randn(rng, D, P), randn(rng, D, P), randn(rng, P)
-    gradtest((X, Y)->colwise(Euclidean(), X, Y), X, Y)
-  end
-  @testset "pairwise(::Euclidean, X, Y; dims=2)" begin
-    rng, D, P, Q = MersenneTwister(123456), 2, 3, 5
-    X, Y, D̄ = randn(rng, D, P), randn(rng, D, Q), randn(rng, P, Q)
-    gradtest((X, Y)->pairwise(Euclidean(), X, Y; dims=2), X, Y)
-  end
-  @testset "pairwise(::Euclidean, X; dims=2)" begin
-    rng, D, P = MersenneTwister(123456), 2, 3
-    X, D̄ = randn(rng, D, P), randn(rng, P, P)
-    gradtest(X->pairwise(Euclidean(), X; dims=2), X)
+    let
+      Xt, Yt = randn(rng, P, D), randn(rng, Q, D)
+      @test gradtest(Xt->pairwise(metric, Xt, Yt; dims=1), Xt)
+      @test gradtest(Yt->pairwise(metric, Xt, Yt; dims=1), Yt)
+    end
+
+    # Check unary pairwise.
+    @test gradtest(X->pairwise(metric, X; dims=2), randn(rng, D, P))
+    @test gradtest(Xt->pairwise(metric, Xt; dims=1), randn(rng, P, D))
   end
 end
 
@@ -922,6 +1027,10 @@ end
   # Scalar
   @test gradient((x,y) -> sum(vcat(x,y)), 1,2) == (1,1)
   @test gradient((x,y) -> sum([x;y]), 1,2) == (1,1)
+
+  # Scalar + Vector
+  @test gradient(x -> sum(vcat(x, 1, x)), rand(3)) == ([2,2,2],)
+  @test gradient((x,y) -> sum(vcat(x, y, y)), rand(3), 4) == ([1,1,1], 2)
 
   # Vector-only.
   cat_test(vcat, randn(1))
@@ -976,6 +1085,8 @@ end
   @test gradient(xs -> hvcat((2,2),xs...)[2,1], [1,2,3,4])[1] == (0,0,1,0)
   @test gradient(xs -> hvcat((2,2),xs...)[1,2], [1,2,3,4])[1] == (0,1,0,0)
   @test gradient(xs -> hvcat((2,2),xs...)[2,2], [1,2,3,4])[1] == (0,0,0,1)
+  # https://github.com/FluxML/Zygote.jl/issues/513
+  @test gradient(x -> hvcat((2,2),1,2,3,x)[4], 4.0) == (1.0,)
 end
 
 @testset "cat(..., dims = $dim)" for dim in 1:5
@@ -1286,6 +1397,11 @@ end
   @test gradient(x -> findfirst(ismissing, x), [1, missing]) == (nothing,)
   @test gradient(x -> findlast(ismissing, x), [1, missing]) == (nothing,)
   @test gradient(x -> findall(ismissing, x)[1], [1, missing]) == (nothing,)
+end
+
+@testset "nograd" begin
+  f(x) = sum(Zygote.nograd(x) + x)
+  @test gradient(f, randn(5)) == (ones(5),)
 end
 
 @testset "fastmath" begin

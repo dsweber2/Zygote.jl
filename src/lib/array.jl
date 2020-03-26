@@ -8,13 +8,16 @@ using Base.Broadcast: broadcasted, broadcast_shape
 @adjoint Array(xs::Array) = Array(xs), ȳ -> (ȳ,)
 
 @nograd size, length, eachindex, axes, Colon(), findfirst, findlast, findall, randn, ones, zeros, one, zero,
-  print, println, any, all
+  any, all
 
 @adjoint rand(dims::Integer...) = rand(dims...), _ -> nothing
 
 @adjoint Base.vect(xs...) = Base.vect(xs...), Δ -> (Δ...,)
 
 @adjoint copy(x::AbstractArray) = copy(x), ȳ -> (ȳ,)
+
+@adjoint collect(x::Tuple) = collect(x), dy -> (Tuple(dy),)
+@adjoint collect(x::AbstractArray) = collect(x), dy -> (dy,)
 
 # Array Constructors
 @adjoint (::Type{T})(x::T) where T<:Array = T(x), ȳ -> (ȳ,)
@@ -40,10 +43,17 @@ _zero(xs::AbstractArray, T=Any) = Union{Nothing, T}[nothing for x in xs]
     dx[inds...] = dy
   else
     dx = _zero(x, eltype(dy))
-    @views dx[inds...] .+= dy
+    dxv = view(dx, inds...)
+    dxv .+= _droplike(dy, dxv)
   end
   (dx, map(_->nothing, inds)...)
 end
+
+_droplike(dy, dxv) = dy
+_droplike(dy::Union{LinearAlgebra.Adjoint, LinearAlgebra.Transpose}, dxv::AbstractVector) =
+  dropdims(dy; dims=2)
+
+@adjoint getindex(::Type{T}, xs...) where {T} = T[xs...], dy -> (nothing, dy...)
 
 @adjoint! setindex!(xs::AbstractArray, x...) = setindex!(xs, x...),
   _ -> error("Mutating arrays is not supported")
@@ -63,6 +73,11 @@ end
   circshift(A, shifts), Δ -> (circshift(Δ, map(-, shifts)), nothing)
 end
 
+@adjoint function reverse(x::AbstractArray, args...; kwargs...)
+  _reverse(t) = reverse(t, args...; kwargs...)
+  _reverse(x), Δ->(_reverse(Δ), map(_->nothing, args)...)
+end
+
 @adjoint permutedims(xs) = permutedims(xs), Δ -> (permutedims(Δ),)
 
 @adjoint permutedims(xs::AbstractVector) = permutedims(xs), Δ -> (vec(permutedims(Δ)),)
@@ -76,13 +91,14 @@ end
 @adjoint reshape(xs, dims...) = reshape(xs, dims...),
   Δ -> (reshape(Δ, size(xs)),map(_->nothing,dims)...)
 
-@adjoint function hvcat(rows::Tuple{Vararg{Int}}, xs::T...) where T<:Number
+@adjoint function hvcat(rows::Tuple{Vararg{Int}}, xs::Number...)
   hvcat(rows, xs...), ȳ -> (nothing, permutedims(ȳ)...)
 end
 
+pull_block_vert(sz, Δ, A::Number) = Δ[sz]
 pull_block_vert(sz, Δ, A::AbstractVector) = Δ[sz-length(A)+1:sz]
 pull_block_vert(sz, Δ, A::AbstractMatrix) = Δ[sz-size(A, 1)+1:sz, :]
-@adjoint function vcat(A::Union{AbstractVector, AbstractMatrix}...)
+@adjoint function vcat(A::Union{AbstractVector, AbstractMatrix, Number}...)
   sz = cumsum([size.(A, 1)...])
   return vcat(A...), Δ->(map(n->pull_block_vert(sz[n], Δ, A[n]), eachindex(A))...,)
 end
@@ -122,6 +138,16 @@ end
     end
     return (Δ′,)
   end
+end
+
+@adjoint repeat(x::AbstractVector, m::Integer) =
+   repeat(x, m), ȳ -> (dropdims(sum(reshape(ȳ, length(x), :); dims=2); dims=2), nothing)
+
+@adjoint function repeat(x::AbstractVecOrMat, m::Integer, n::Integer=1)
+   return repeat(x, m, n), function (ȳ)
+      ȳ′ = reshape(ȳ, size(x,1), m, size(x,2), n)
+      return reshape(sum(ȳ′; dims=(2,4)), size(x)), nothing, nothing
+   end
 end
 
 @adjoint getindex(i::Int, j::Int) = i[j], _ -> nothing
@@ -165,6 +191,15 @@ end
   return x[p], x̄ -> (x̄[invperm(p)],)
 end
 
+@adjoint function filter(f, x::AbstractVector)
+    t = map(f, x)
+    x[t], Δ -> begin
+        dx = _zero(x, eltype(Δ))
+        dx[t] .= Δ
+        (nothing, dx)
+    end
+end
+
 # Reductions
 
 @adjoint function sum(xs::AbstractArray; dims = :)
@@ -176,26 +211,22 @@ end
 end
 
 function _pullback(cx::AContext, ::typeof(sum), f, xs::AbstractArray)
-  y, back = pullback(cx, (xs -> sum(f.(xs))), xs)
-  y, ȳ -> (nothing, nothing, back(ȳ)...)
+  y, back = pullback(cx, ((f, xs) -> sum(f.(xs))), f, xs)
+  y, ȳ -> (nothing, back(ȳ)...)
 end
 
 @adjoint function sum(::typeof(abs2), X::AbstractArray; dims = :)
   return sum(abs2, X; dims=dims), Δ::Union{Number, AbstractArray}->(nothing, ((2Δ) .* X))
 end
 
-@adjoint function prod(xs::AbstractArray{<:Number}; dims = :)
-  if dims === (:)
-    prod(xs), Δ -> (prod(xs) ./ xs .* Δ,)
-  else
-    prod(xs, dims = dims),
-      Δ -> (reshape(.*(circshift.([reshape(xs, length(xs))], 1:length(xs)-1)...), size(xs)) .* Δ,)
-  end
+@adjoint function prod(xs::AbstractArray; dims = :)
+  p = prod(xs; dims = dims)
+  p, Δ -> (p ./ xs .* Δ,)
 end
 
 function _pullback(cx::AContext, ::typeof(prod), f, xs::AbstractArray)
-  y, back = pullback(cx, (xs -> prod(f.(xs))), xs)
-  y, ȳ -> (nothing, nothing, back(ȳ)...)
+  y, back = pullback(cx, ((f, xs) -> prod(f.(xs))), f, xs)
+  y, ȳ -> (nothing, back(ȳ)...)
 end
 
 @adjoint function maximum(xs::AbstractArray; dims = :)
@@ -243,6 +274,16 @@ _backvar(xs, Δ, N::Int, mean) = (convert(eltype(xs), 2/N) .* Δ .* (xs .- mean)
     return s, Δ -> _backvar(xs, Δ ./ (2 .* s), corrected, mean, dims)
 end
 
+@adjoint function cumsum(xs::AbstractVector; dims::Integer = 1)
+  dims == 1 || return copy(xs), Δ -> (Δ,)
+  cumsum(xs), Δ -> (reverse(cumsum(reverse(Δ))),)
+end
+@adjoint function cumsum(xs::AbstractArray; dims::Integer)
+  dims <= ndims(xs) || return copy(xs), Δ -> (Δ,)
+  cumsum(xs; dims=dims), Δ -> begin
+    (reverse(cumsum(reverse(Δ, dims=dims), dims=dims), dims=dims),)
+  end
+end
 
 # LinAlg
 # ======
@@ -301,13 +342,13 @@ end
 
 @adjoint diag(A::AbstractMatrix) = diag(A), Δ->(Diagonal(Δ),)
 
-@adjoint det(xs) = det(xs), Δ -> (Δ * det(xs) * transpose(inv(xs)),)
+@adjoint det(xs::Union{Number, AbstractMatrix}) = det(xs), Δ -> (Δ * det(xs) * inv(xs)',)
 
-@adjoint logdet(xs) = logdet(xs), Δ -> (Δ * transpose(inv(xs)),)
+@adjoint logdet(xs::Union{Number, AbstractMatrix}) = logdet(xs), Δ -> (Δ * inv(xs)',)
 
-@adjoint logabsdet(xs) = logabsdet(xs), Δ -> (Δ[1] * transpose(inv(xs)),)
+@adjoint logabsdet(xs::AbstractMatrix) = logabsdet(xs), Δ -> (Δ[1] * inv(xs)',)
 
-@adjoint function inv(A)
+@adjoint function inv(A::Union{Number, AbstractMatrix})
   Ainv = inv(A)
   return Ainv, function (Δ)
     ∇A = - Ainv' * Δ * Ainv'
@@ -440,17 +481,22 @@ end
   return C, Δ::NamedTuple->(Δ.factors[1, 1] / (2 * C.U[1, 1]),)
 end
 
-@adjoint function cholesky(Σ::Diagonal)
-  C = cholesky(Σ)
-  return C, Δ::NamedTuple->(Diagonal(diag(Δ.factors) .* inv.(2 .* C.factors.diag)),)
+@adjoint function cholesky(Σ::Diagonal; check = true)
+  C = cholesky(Σ, check = check)
+  return C, Δ::NamedTuple -> begin
+    issuccess(C) || throw(PosDefException(C.info))
+    return Diagonal(diag(Δ.factors) .* inv.(2 .* C.factors.diag)), nothing
+  end
 end
 
 # Implementation due to Seeger, Matthias, et al. "Auto-differentiating linear algebra."
-@adjoint function cholesky(Σ::Union{StridedMatrix, Symmetric{<:Real, <:StridedMatrix}})
-  C = cholesky(Σ)
+@adjoint function cholesky(Σ::Union{StridedMatrix, Symmetric{<:Real, <:StridedMatrix}}; check = true)
+  C = cholesky(Σ, check = check)
   return C, function(Δ::NamedTuple)
+    issuccess(C) || throw(PosDefException(C.info))
     U, Ū = C.U, Δ.factors
-    Σ̄ = Ū * U'
+    Σ̄  = similar(U.data)
+    mul!(Σ̄ , Ū, U')
     Σ̄ = copytri!(Σ̄, 'U')
     Σ̄ = ldiv!(U, Σ̄)
     BLAS.trsm!('R', 'U', 'T', 'N', one(eltype(Σ)), U.data, Σ̄)

@@ -1,4 +1,5 @@
-@nograd readline, Base.gc_num, Base.time_ns
+@nograd readline, Base.gc_num, Base.time_ns, Base.print, Base.println, Base.show,
+  Core.show, Core.print, Core.println
 
 # Gradient of AD stacks
 
@@ -22,6 +23,7 @@ end
 # Dictionaries
 
 grad_mut(d::AbstractDict) = Dict()
+grad_mut(d::IdDict) = IdDict()
 
 # TODO perhaps look up mutable gradients in `pullback`
 function accum(a::AbstractDict, b::AbstractDict)
